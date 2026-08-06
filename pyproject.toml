@@ -1,0 +1,23 @@
+[project]
+name = "parliament-digital-library"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.34.2",
+    "selenium>=4.46.0",
+]
+
+[project.scripts]
+pdl-crawl = "crawler.run:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["crawler"]
