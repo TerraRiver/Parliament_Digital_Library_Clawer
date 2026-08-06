@@ -48,7 +48,19 @@ uv run pdl-crawl
 Chrome 装在非默认位置的话，再加 `--chrome-binary`（或环境变量 `PDL_CHROME_BINARY`）。
 
 另一条路是让 Selenium Manager 能联网（挂代理），并清掉旧缓存后重试：
-`rmdir /s /q "%USERPROFILE%\.cache\selenium"`（Linux 是 `rm -rf ~/.cache/selenium`）。
+
+```powershell
+# PowerShell
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\selenium" -ErrorAction SilentlyContinue
+```
+
+```bash
+# Linux / macOS
+rm -rf ~/.cache/selenium
+```
+
+注意清缓存只在**网络确实通了**之后才有意义 —— 缓存没了但仍连不上 googlechromelabs.github.io，
+Selenium Manager 就彻底没 driver 可用了，还是得走上面 `--driver-path` 那条路。
 
 ## 断点续跑
 

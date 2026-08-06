@@ -40,8 +40,8 @@ chromedriver，网络不通时它会退回用缓存里的旧版本，就会出�
      国内可用镜像：https://registry.npmmirror.com/binary.html?path=chrome-for-testing/
      选与 Chrome 同大版本的目录，下 chromedriver-win64.zip 解压即可。
   2) 让 Selenium Manager 能联网（挂代理），并清掉旧缓存后重试：
-       Windows: rmdir /s /q "%USERPROFILE%\\.cache\\selenium"
-       Linux:   rm -rf ~/.cache/selenium
+       PowerShell: Remove-Item -Recurse -Force "$env:USERPROFILE\\.cache\\selenium"
+       Linux:      rm -rf ~/.cache/selenium
 """
 
 
