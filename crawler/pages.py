@@ -21,7 +21,14 @@ from .browser import dismiss_consent, goto
 
 RESULT_SELECTOR = "ds-item-search-result-list-element"
 ITEM_READY_SELECTOR = "ds-metadata-field-wrapper"
+FILE_ROW_SELECTOR = "div.row.py-2 .name-file"
 DOWNLOAD_BTN = "button.link-download-doc"
+
+# 文件行渲染延迟抖动很大，等到数量稳定再读；真没有文件的条目会一直等到超时
+_FILE_WAIT_MIN = 1.5       # 至少等这么久才开始认稳定，太快退出会漏掉慢加载的行
+_FILE_WAIT_STABLE_POLLS = 3
+_FILE_WAIT_INTERVAL = 0.3
+_FILE_WAIT_TIMEOUT = 12.0
 
 _SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
 
@@ -124,14 +131,36 @@ def scrape_list_page(driver, search_url: str, page: int, page_size: int, settle:
     return out
 
 
-def scrape_item_page(driver, item_url: str, settle: float = 0.6) -> dict[str, Any]:
-    """打开详情页（等价于点 View），抓字段与文件清单。"""
+def scrape_item_page(driver, item_url: str) -> dict[str, Any]:
+    """打开详情页（等价于点 View），抓字段与文件清单。
+
+    ds-item-page-file-section 这个容器本身出现得早，但里面的文件行是另一次
+    异步请求（拿 bitstream 列表）填进去的，实测延迟在 0.5~3s 之间抖动很大。
+    之前固定 sleep(0.6) 经常抢跑，把还没渲染出来的文件列表当成"无附件"
+    （实测抽样误判率 97.5%）。这里改成等文件行数量稳定下来再读，真没有文件
+    的条目最多等 _FILE_WAIT_TIMEOUT 秒兜底。
+    """
     goto(driver, item_url, ITEM_READY_SELECTOR, timeout=60)
-    time.sleep(settle)
+    _wait_for_files_settled(driver)
     data = driver.execute_script(_JS_ITEM)
     for f in data["files"]:
         f["size_bytes_expected"] = parse_size(f.get("size_text"))
     return data
+
+
+def _wait_for_files_settled(driver) -> None:
+    """等文件行数量稳定下来（不管稳不稳定在 0 还是 N）再返回。"""
+    start = time.monotonic()
+    prev, stable = -1, 0
+    while time.monotonic() - start < _FILE_WAIT_TIMEOUT:
+        count = driver.execute_script(
+            "return document.querySelectorAll(arguments[0]).length", FILE_ROW_SELECTOR
+        )
+        stable = stable + 1 if count == prev else 0
+        prev = count
+        if time.monotonic() - start >= _FILE_WAIT_MIN and stable >= _FILE_WAIT_STABLE_POLLS:
+            return
+        time.sleep(_FILE_WAIT_INTERVAL)
 
 
 def find_download_buttons(driver):
