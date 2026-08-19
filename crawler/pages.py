@@ -21,7 +21,6 @@ from .browser import dismiss_consent, goto
 
 RESULT_SELECTOR = "ds-item-search-result-list-element"
 ITEM_READY_SELECTOR = "ds-metadata-field-wrapper"
-FILE_ROW_SELECTOR = "div.row.py-2 .name-file"
 DOWNLOAD_BTN = "button.link-download-doc"
 
 # 文件行渲染延迟抖动很大，等到数量稳定再读；真没有文件的条目会一直等到超时
@@ -73,6 +72,13 @@ const files = Array.from(document.querySelectorAll('div.row.py-2')).map(row => {
   return {name: n.textContent.trim(), size_text: s ? s.textContent.trim() : null};
 }).filter(Boolean);
 return {fields, files, title: document.title};
+"""
+
+# 与 _JS_ITEM 里 n && btn 判断口径一致，用来判断"文件行是否渲染完整"
+_JS_FILE_COMPLETE_COUNT = """
+return Array.from(document.querySelectorAll('div.row.py-2')).filter(row =>
+  row.querySelector('.name-file') && row.querySelector('ds-file-download-link button')
+).length;
 """
 
 
@@ -149,16 +155,23 @@ def scrape_item_page(driver, item_url: str) -> dict[str, Any]:
 
 
 def _wait_for_files_settled(driver) -> None:
-    """等文件行数量稳定下来（不管稳不稳定在 0 还是 N）再返回。"""
+    """等文件行数量稳定下来再返回。
+
+    只数 .name-file 是不够的：真正算作"文件"还需要 ds-file-download-link
+    按钮也渲染出来（见 _JS_ITEM 里 n && btn 的判断），这两者是两次独立的异步
+    渲染，文件名经常先于按钮出现。之前只看 .name-file 计数，会在按钮还没
+    渲染出来时就误判"稳定"提前退出。这里改成数完整行（名字+按钮都在）。
+
+    另外，稳定在 0 不能提前退出 —— 真没有文件的条目必须等满
+    _FILE_WAIT_TIMEOUT 才能下结论，否则会把"异步请求还没回来"当成"没有文件"。
+    """
     start = time.monotonic()
     prev, stable = -1, 0
     while time.monotonic() - start < _FILE_WAIT_TIMEOUT:
-        count = driver.execute_script(
-            "return document.querySelectorAll(arguments[0]).length", FILE_ROW_SELECTOR
-        )
+        count = driver.execute_script(_JS_FILE_COMPLETE_COUNT)
         stable = stable + 1 if count == prev else 0
         prev = count
-        if time.monotonic() - start >= _FILE_WAIT_MIN and stable >= _FILE_WAIT_STABLE_POLLS:
+        if count > 0 and time.monotonic() - start >= _FILE_WAIT_MIN and stable >= _FILE_WAIT_STABLE_POLLS:
             return
         time.sleep(_FILE_WAIT_INTERVAL)
 

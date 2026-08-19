@@ -67,8 +67,9 @@ Selenium Manager 就彻底没 driver 可用了，还是得走上面 `--driver-pa
 直接重跑同一条命令即可，已完成的条目会跳过：
 
 ```bash
-uv run pdl-crawl                    # 从上次断的地方继续
-uv run pdl-crawl --retry-failed     # 顺带重试之前失败的条目
+uv run pdl-crawl                       # 从上次断的地方继续
+uv run pdl-crawl --retry-failed        # 顺带重试之前失败的条目
+uv run pdl-crawl --recheck-no-file     # 重新核实之前标记为"无附件"的条目
 ```
 
 Ctrl+C 会在当前条目结束后干净退出并保存进度（连按两次强制退出）。
@@ -104,6 +105,11 @@ data/
 
 元数据始终是 Selenium 从渲染后的 DOM 抓的，两种模式没有区别。批量跑建议用 `api`。
 
+下载过程会用 `tqdm` 显示实时进度条（速度、百分比、ETA）。api 模式下用 `--concurrency`
+控制**同一条目内**多个文件的并发下载数（默认 3）——多数条目只有 1 个附件，并发数在这种条目上
+不会体现出来，只有像 `AU1665.pdf` / `AU1665_hindi.pdf` 这种一个条目挂多个文件的情况才会用上。
+这不是"同时处理多个条目"的并发，翻页/条目级别始终是顺序处理的。
+
 ## 常用参数
 
 ```
@@ -114,8 +120,10 @@ data/
 --max-pages N         本次最多翻几页
 --max-items N         本次最多处理几条
 --no-download         只抓元数据
+--concurrency N       api 模式下，同一条目内并发下载的文件数（默认 3；click 模式恒为顺序下载）
 --delay SEC           每条之间的间隔（默认 1.0，带 30% 抖动）
 --retry-failed        重试标记为 failed 的条目
+--recheck-no-file     重新核实标记为 no_file 的条目（修复过去误判"无附件"的老数据用）
 --restart-every N     每 N 条重启一次浏览器释放内存（默认 200）
 --headed              显示浏览器窗口，调试用
 --driver-path PATH    手动指定 chromedriver（等价环境变量 PDL_CHROMEDRIVER）

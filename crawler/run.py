@@ -125,7 +125,9 @@ class Crawler:
 
             todo = [
                 r for r in rows
-                if self.state.needs_work(r["uuid"], self.args.retry_failed, self.args.max_retries)
+                if self.state.needs_work(
+                    r["uuid"], self.args.retry_failed, self.args.max_retries, self.args.recheck_no_file
+                )
             ]
             print(f"[翻页] 第 {page} 页：{len(rows)} 条结果，{len(todo)} 条待处理")
 
@@ -229,6 +231,7 @@ class Crawler:
                     min_timeout=self.args.min_timeout,
                     stall_timeout=self.args.stall_timeout,
                     api_base=self.args.api_base,
+                    concurrency=self.args.concurrency,
                 )
                 self.state.update(uuid, status=st.DONE, files=files)
                 total = sum(f["bytes"] for f in files)
@@ -312,6 +315,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="click 点页面按钮下载；api 走 REST 直链（更快、可续传）")
     p.add_argument("--no-download", action="store_true", help="只抓元数据，不下载附件")
     p.add_argument("--api-base", default=DEFAULT_API_BASE, help="DSpace REST 根地址（api 模式用）")
+    p.add_argument("--concurrency", type=int, default=3,
+                   help="api 模式下，同一条目内并发下载的文件数（click 模式恒为顺序下载）")
 
     p.add_argument("--headed", action="store_true", help="显示浏览器窗口（调试用）")
     p.add_argument("--driver-path", default=None,
@@ -323,6 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-retries", type=int, default=3, help="单条目累计失败多少次后标记为 failed")
     p.add_argument("--page-retries", type=int, default=3, help="单次页面加载的重试次数")
     p.add_argument("--retry-failed", action="store_true", help="重跑此前标记为 failed 的条目")
+    p.add_argument("--recheck-no-file", action="store_true",
+                   help="重新核实此前标记为 no_file 的条目（用于修复过去误判"
+                        "\"无附件\"的老数据、回填漏抓的文件）")
     p.add_argument("--restart-every", type=int, default=200, help="每处理多少条重启一次浏览器")
     p.add_argument("--save-every", type=int, default=5, help="每处理多少条写一次 state.json")
 

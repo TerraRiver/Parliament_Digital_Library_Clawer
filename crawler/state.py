@@ -127,11 +127,13 @@ class State:
         rec["updated_at"] = now()
         return rec
 
-    def needs_work(self, uuid: str, retry_failed: bool, max_retries: int) -> bool:
+    def needs_work(self, uuid: str, retry_failed: bool, max_retries: int, recheck_no_file: bool = False) -> bool:
         rec = self.data["items"].get(uuid)
         if rec is None:
             return True
-        if rec["status"] in (DONE, NO_FILE):
+        if rec["status"] == NO_FILE:
+            return recheck_no_file
+        if rec["status"] == DONE:
             return False
         if rec["status"] == FAILED and not retry_failed:
             return False
