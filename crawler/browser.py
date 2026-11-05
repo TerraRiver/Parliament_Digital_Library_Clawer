@@ -1,4 +1,4 @@
-"""Selenium 驱动的创建与页面通用操作。"""
+"""Playwright 浏览器会话的创建与页面通用操作。"""
 
 from __future__ import annotations
 
@@ -6,18 +6,17 @@ import os
 import time
 from pathlib import Path
 
-from selenium import webdriver
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    NoSuchElementException,
-    SessionNotCreatedException,
-    TimeoutException,
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
 )
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+
+from .stealth import STEALTH_INIT_SCRIPT, human_move_and_click, human_reset_gaze
 
 # 站点用的是 Klaro 隐私弹窗，不关掉会挡住 Download 按钮
 CONSENT_ACCEPT = "button.cm-btn-success"
@@ -28,21 +27,51 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 )
 
-
-DRIVER_HINT = """
-无法启动 Chrome。Selenium Manager 需要访问 googlechromelabs.github.io 才能下载匹配的
-chromedriver，网络不通时它会退回用缓存里的旧版本，就会出现版本对不上的报错。
+BROWSER_HINT = """
+无法启动浏览器。Playwright 默认使用自带的 Chromium，未安装时会尝试调用本机 Chrome。
 
 解决办法（任选其一）：
-  1) 手动下载与本机 Chrome 大版本一致的 chromedriver，然后指定路径：
-       uv run pdl-crawl --driver-path "C:\\tools\\chromedriver.exe"
-     或设环境变量 PDL_CHROMEDRIVER。
-     国内可用镜像：https://registry.npmmirror.com/binary.html?path=chrome-for-testing/
-     选与 Chrome 同大版本的目录，下 chromedriver-win64.zip 解压即可。
-  2) 让 Selenium Manager 能联网（挂代理），并清掉旧缓存后重试：
-       PowerShell: Remove-Item -Recurse -Force "$env:USERPROFILE\\.cache\\selenium"
-       Linux:      rm -rf ~/.cache/selenium
+  1) 安装 Playwright 匹配的 Chromium（推荐）：
+       uv run playwright install chromium
+  2) 安装标准版 Google Chrome，或手动指定本机浏览器可执行文件路径：
+       uv run pdl-crawl --chrome-binary "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+     或设环境变量 PDL_CHROME_BINARY。
 """
+
+_DRIVER_PATH_WARNED = False
+
+
+class BrowserSession:
+    """包装 Playwright / Browser / BrowserContext / Page 生命周期，对外暴露与原 driver 兼容的接口。"""
+
+    def __init__(
+        self,
+        playwright: Playwright,
+        browser: Browser,
+        context: BrowserContext,
+        page: Page,
+    ) -> None:
+        self.playwright = playwright
+        self.browser = browser
+        self.context = context
+        self.page = page
+        self._pdl_session = None
+
+    def __getattr__(self, name: str):
+        return getattr(self.page, name)
+
+    def quit(self) -> None:
+        if self._pdl_session is not None:
+            try:
+                self._pdl_session.close()
+            except Exception:
+                pass
+            self._pdl_session = None
+        for closer in (self.page.close, self.context.close, self.browser.close, self.playwright.stop):
+            try:
+                closer()
+            except Exception:
+                pass
 
 
 def make_driver(
@@ -51,81 +80,109 @@ def make_driver(
     page_load_timeout: int = 120,
     driver_path: str | None = None,
     browser_binary: str | None = None,
-):
-    """创建 Chrome 驱动。
+) -> BrowserSession:
+    """创建 Playwright Chromium 会话。
 
-    默认交给 Selenium Manager 自动准备 chromedriver；它需要联网，网络不通时
-    会退回缓存里的旧版本并跟本机 Chrome 版本冲突 —— 这种环境下用 driver_path
-    显式指定即可（也可通过 PDL_CHROMEDRIVER / PDL_CHROME_BINARY 环境变量给）。
+    优先使用 --chrome-binary / PDL_CHROME_BINARY；未指定时默认启动 Playwright 自带的
+    Chromium，若尚未执行 `playwright install chromium`，自动回退尝试本机安装的 Chrome。
     """
-    driver_path = driver_path or os.environ.get("PDL_CHROMEDRIVER")
+    global _DRIVER_PATH_WARNED
+    if (driver_path or os.environ.get("PDL_CHROMEDRIVER")) and not _DRIVER_PATH_WARNED:
+        print("[driver] 提示：已迁移至 Playwright，不再需要 chromedriver，忽略 --driver-path / PDL_CHROMEDRIVER")
+        _DRIVER_PATH_WARNED = True
+
     browser_binary = browser_binary or os.environ.get("PDL_CHROME_BINARY")
-
     download_dir.mkdir(parents=True, exist_ok=True)
-    opts = Options()
-    if browser_binary:
-        opts.binary_location = browser_binary
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1600,1200")
-    opts.add_argument(f"--user-agent={USER_AGENT}")
-    opts.add_experimental_option(
-        "prefs",
-        {
-            "download.default_directory": str(download_dir),
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": True,
-            # 不要用内置阅读器打开 PDF，否则点 Download 只会在标签页里预览
-            "plugins.always_open_pdf_externally": True,
-        },
-    )
-    service = Service(executable_path=driver_path) if driver_path else None
+
+    launch_kwargs = {
+        "headless": headless,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ],
+        "downloads_path": str(download_dir),
+        # 交由 crawler/run.py 的信号处理器实现"完成当前条目后安全退出"
+        "handle_sigint": False,
+        "handle_sigterm": False,
+        "handle_sighup": False,
+    }
+
+    pw = sync_playwright().start()
+    browser: Browser | None = None
     try:
-        driver = webdriver.Chrome(options=opts, service=service)
-    except SessionNotCreatedException as exc:
-        raise SessionNotCreatedException(f"{exc.msg}\n{DRIVER_HINT}") from exc
-    driver.set_page_load_timeout(page_load_timeout)
-    # headless 模式下 prefs 有时不生效，用 CDP 再钉一次下载目录
-    try:
-        driver.execute_cdp_cmd(
-            "Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(download_dir)}
+        try:
+            if browser_binary:
+                browser = pw.chromium.launch(executable_path=browser_binary, **launch_kwargs)
+            else:
+                try:
+                    browser = pw.chromium.launch(**launch_kwargs)
+                except PlaywrightError:
+                    browser = pw.chromium.launch(channel="chrome", **launch_kwargs)
+        except PlaywrightError as exc:
+            raise PlaywrightError(f"{exc}\n{BROWSER_HINT}") from exc
+
+        context = browser.new_context(
+            viewport={"width": 1600, "height": 1200},
+            user_agent=USER_AGENT,
+            accept_downloads=True,
         )
-    except Exception:
-        pass
-    return driver
+        context.add_init_script(STEALTH_INIT_SCRIPT)
+        page = context.new_page()
+        page.set_default_navigation_timeout(page_load_timeout * 1000)
+        page.set_default_timeout(page_load_timeout * 1000)
+        return BrowserSession(pw, browser, context, page)
+    except BaseException:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise
 
 
-def dismiss_consent(driver, timeout: float = 0.0) -> bool:
+def dismiss_consent(driver: BrowserSession | Page, timeout: float = 0.0) -> bool:
     """关闭隐私弹窗。接受后站点会写 cookie，同一 session 内通常只需一次。"""
+    btn = driver.locator(CONSENT_ACCEPT).first
     try:
-        if timeout:
-            WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, CONSENT_ACCEPT))
-            )
-        btn = driver.find_element(By.CSS_SELECTOR, CONSENT_ACCEPT)
-    except (NoSuchElementException, TimeoutException):
+        if timeout > 0:
+            btn.wait_for(state="visible", timeout=timeout * 1000)
+        elif btn.count() == 0 or not btn.is_visible():
+            return False
+    except (PlaywrightTimeoutError, PlaywrightError):
         return False
+
     try:
-        btn.click()
-    except ElementClickInterceptedException:
-        driver.execute_script("arguments[0].click();", btn)
-    # 等遮罩淡出
-    for _ in range(20):
-        if not driver.find_elements(By.CSS_SELECTOR, CONSENT_OVERLAY):
+        human_move_and_click(driver, btn, timeout=2_000, scroll_if_needed=False)
+    except PlaywrightError:
+        try:
+            btn.evaluate("el => el.click()", timeout=2_000)
+        except PlaywrightError:
+            return False
+
+    # 等遮罩淡出（若点击未生效，半途补一次 JS click 兜底）
+    overlay = driver.locator(CONSENT_OVERLAY)
+    for i in range(20):
+        try:
+            if overlay.count() == 0:
+                break
+            if i == 8:
+                btn.evaluate("el => el.click()", timeout=1_000)
+        except PlaywrightError:
             break
         time.sleep(0.1)
+    human_reset_gaze(driver)
     return True
 
 
-def goto(driver, url: str, wait_for: str, timeout: int = 60) -> None:
+def goto(driver: BrowserSession | Page, url: str, wait_for: str, timeout: int = 60) -> None:
     """打开页面并等待 Angular 把关键元素渲染出来。"""
-    driver.get(url)
+    driver.goto(url, wait_until="domcontentloaded")
     dismiss_consent(driver)
-    WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, wait_for))
-    )
+    driver.wait_for_selector(wait_for, state="attached", timeout=timeout * 1000)
     dismiss_consent(driver)

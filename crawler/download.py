@@ -1,29 +1,32 @@
 """文件下载。
 
 两种模式：
-  click —— 真的去点页面上的 Download 按钮，由 Chrome 完成下载（默认，行为与人工一致）
+  click —— 真的去点页面上的 Download 按钮，由浏览器完成下载（默认，行为与人工一致）
   api   —— 从 DSpace REST 接口取 bitstream 直链，用 requests 流式下载
             （支持断点续传的 Range 请求，大文件更稳、更快）
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
+import random
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import requests
+from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from tqdm import tqdm
 
 from .browser import USER_AGENT
 from .pages import find_download_buttons
-
-PARTIAL_SUFFIXES = (".crdownload", ".tmp", ".part")
+from .stealth import human_move_and_click, human_reset_gaze, human_scroll_to_element
 
 
 class DownloadError(RuntimeError):
@@ -129,66 +132,128 @@ def _download_via_click(
     _clear_dir(staging_dir)
 
     buttons = find_download_buttons(driver)
-    if index >= len(buttons):
-        raise DownloadError(f"页面上只有 {len(buttons)} 个下载按钮，取不到第 {index + 1} 个")
-    btn = buttons[index]
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-    try:
-        btn.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", btn)
+    count = buttons.count()
+    if index >= count:
+        raise DownloadError(f"页面上只有 {count} 个下载按钮，取不到第 {index + 1} 个")
+    btn = buttons.nth(index)
+    human_scroll_to_element(driver, btn)
 
     timeout = max(min_timeout, (expected or 0) / max(min_speed, 1))
-    finished = _wait_for_download(
-        staging_dir, timeout=timeout, stall_timeout=stall_timeout, expected=expected, label=label
-    )
+    try:
+        with driver.expect_download(timeout=min(timeout, 60.0) * 1000) as dl_info:
+            try:
+                human_move_and_click(driver, btn, timeout=5_000, scroll_if_needed=False)
+            except Exception:
+                btn.evaluate("el => el.click()", timeout=5_000)
+    except PlaywrightTimeoutError as exc:
+        raise DownloadError(f"点击下载按钮后未触发下载响应：{exc}") from exc
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(finished), str(target))
+    download = dl_info.value
+    _save_download_with_progress(
+        download,
+        target=target,
+        staging_dir=staging_dir,
+        timeout=timeout,
+        stall_timeout=stall_timeout,
+        expected=expected,
+        label=label,
+    )
+    human_reset_gaze(driver)
     return target.stat().st_size
 
 
-def _wait_for_download(
-    staging_dir: Path,
+def _save_download_with_progress(
+    download,
     *,
+    target: Path,
+    staging_dir: Path,
     timeout: float,
     stall_timeout: float,
     expected: int | None = None,
     label: str | None = None,
-) -> Path:
-    """等 Chrome 把文件下完：先出现 .crdownload，写完后重命名成正式文件。"""
-    deadline = time.monotonic() + timeout
-    last_size, last_progress = -1, time.monotonic()
+) -> None:
+    """等待 Playwright 在 staging_dir 内下载完成并移入 target，同时后台监控刷新进度条与检测卡死。"""
     bar = _make_bar(label, expected, position=0) if label else None
-    try:
-        while time.monotonic() < deadline:
-            files = [p for p in staging_dir.iterdir() if p.is_file()]
-            done = [p for p in files if not p.name.endswith(PARTIAL_SUFFIXES)]
-            partial = [p for p in files if p.name.endswith(PARTIAL_SUFFIXES)]
+    stop_event = threading.Event()
+    abort_error: list[DownloadError] = []
 
-            if done and not partial:
-                if bar:
-                    bar.update(max(0, max(p.stat().st_size for p in done) - bar.n))
-                return max(done, key=lambda p: p.stat().st_mtime)
+    def _watch() -> None:
+        deadline = time.monotonic() + timeout
+        last_size, last_progress = -1, time.monotonic()
+        while not stop_event.wait(0.5):
+            try:
+                files = [p for p in staging_dir.iterdir() if p.is_file()]
+                size = sum(_safe_file_size(p) for p in files)
+            except OSError:
+                size = last_size if last_size >= 0 else 0
 
-            size = sum(p.stat().st_size for p in files)
             if size != last_size:
                 last_size, last_progress = size, time.monotonic()
-            elif files and time.monotonic() - last_progress > stall_timeout:
-                raise DownloadError(f"下载卡住：{stall_timeout:.0f}s 内体积没有增长（已收 {size} 字节）")
+            elif time.monotonic() - last_progress > stall_timeout:
+                abort_error.append(
+                    DownloadError(f"下载卡住：{stall_timeout:.0f}s 内体积没有增长（已收 {size} 字节）")
+                )
+                _cancel_download_threadsafe(download)
+                return
 
-            if bar:
-                bar.update(max(0, size - bar.n))
-            time.sleep(0.5)
+            if time.monotonic() >= deadline:
+                abort_error.append(DownloadError(f"下载超时（{timeout:.0f}s）"))
+                _cancel_download_threadsafe(download)
+                return
 
-        raise DownloadError(f"下载超时（{timeout:.0f}s）")
+            if bar and size > bar.n:
+                bar.update(size - bar.n)
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+    try:
+        finished_path = download.path()
+        if abort_error:
+            raise abort_error[0]
+        err = download.failure()
+        if err:
+            raise DownloadError(f"浏览器下载失败：{err}")
+        if not finished_path or not finished_path.exists() or finished_path.stat().st_size == 0:
+            raise DownloadError("下载完成但临时文件为空")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(finished_path), str(target))
+        if bar:
+            final_size = target.stat().st_size
+            if final_size > bar.n:
+                bar.update(final_size - bar.n)
+    except PlaywrightError as exc:
+        if abort_error:
+            raise abort_error[0] from exc
+        raise DownloadError(f"下载异常：{exc}") from exc
     finally:
+        stop_event.set()
+        watcher.join(timeout=2.0)
         if bar:
             bar.close()
+        try:
+            download.delete()
+        except Exception:
+            pass
+
+
+def _cancel_download_threadsafe(download) -> None:
+    try:
+        impl = getattr(download, "_impl_obj", None)
+        if impl is not None and getattr(impl, "_loop", None) is not None:
+            asyncio.run_coroutine_threadsafe(impl.cancel(), impl._loop)
+    except Exception:
+        pass
+
+
+def _safe_file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _clear_dir(path: Path) -> None:
-    """清掉上一条目留下的残留文件。Chrome/杀软有时还短暂占着文件句柄
+    """清掉上一条目留下的残留文件。浏览器/杀软有时还短暂占着文件句柄
     （WinError 32），重试一次，还不行就跳过，不因为清残留失败搞垮这一条目。
     """
     for p in path.iterdir():
@@ -217,13 +282,13 @@ def _session_from_driver(driver, api_base: str) -> requests.Session:
         s.headers["User-Agent"] = USER_AGENT
         s.headers["Referer"] = api_base.rsplit("/server", 1)[0] + "/"
         driver._pdl_session = s
-    for c in driver.get_cookies():
+    for c in driver.context.cookies():
         s.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
     return s
 
 
 def _with_http_retries(fn, attempts: int = 3, what: str = "请求"):
-    """网络抖动（SSL EOF、连接重置）很常见，就地重试几次，不浪费条目的重试额度。"""
+    """网络抖动（SSL EOF、连接重置）或 429 限流时就地重试，不浪费条目的重试额度。"""
     last: Exception | None = None
     for i in range(1, attempts + 1):
         try:
@@ -231,7 +296,16 @@ def _with_http_retries(fn, attempts: int = 3, what: str = "请求"):
         except (requests.RequestException, OSError) as exc:
             last = exc
             if i < attempts:
-                time.sleep(min(2**i, 15))
+                if (
+                    isinstance(exc, requests.HTTPError)
+                    and exc.response is not None
+                    and exc.response.status_code == 429
+                ):
+                    wait = 30.0 + random.uniform(0, 5)
+                    print(f"  [限流] {what}触发 HTTP 429，冷却 {wait:.1f}s 后重试 …")
+                    time.sleep(wait)
+                else:
+                    time.sleep(min(2**i, 15))
     raise DownloadError(f"{what}重试 {attempts} 次仍失败：{type(last).__name__}: {last}") from last
 
 

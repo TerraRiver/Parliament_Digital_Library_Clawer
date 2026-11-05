@@ -1,6 +1,6 @@
 # Parliament Digital Library 爬虫
 
-用 Selenium 爬取 [印度议会数字图书馆](https://elibrary.sansad.in) 搜索结果：
+用 Playwright 爬取 [印度议会数字图书馆](https://elibrary.sansad.in) 搜索结果：
 翻页 → 逐条打开详情页（等价于点 **View**）→ 抓元数据 → 点 **Download** 下载附件。
 全程断点续跑，进度写在 `data/state.json`。
 
@@ -9,6 +9,9 @@
 ```bash
 uv sync
 
+# 安装 Playwright 浏览器内核（若本机已装有 Google Chrome 可跳过，程序会自动回退调用本机 Chrome）
+uv run playwright install chromium
+
 # 先小跑一下看看（只抓元数据，不下载文件）
 uv run pdl-crawl --max-items 20 --no-download
 
@@ -16,51 +19,24 @@ uv run pdl-crawl --max-items 20 --no-download
 uv run pdl-crawl
 ```
 
-Chrome 和 chromedriver 由 Selenium Manager 首次运行时自动下载，不用手动装。
-**如果网络访问不了 `googlechromelabs.github.io`（国内常见），见下面「chromedriver 版本对不上」。**
+## 浏览器配置
 
-## chromedriver 版本对不上
+Playwright 直接通过 CDP 协议控制浏览器，**不需要 `chromedriver`**，彻底避免了浏览器与驱动版本不匹配的问题。
 
-报错长这样：
+启动优先级如下：
+1. 若指定了 `--chrome-binary`（或环境变量 `PDL_CHROME_BINARY`），直接使用该可执行文件；
+2. 否则默认启动 `uv run playwright install chromium` 安装的自带 Chromium；
+3. 若未安装自带 Chromium（例如国内网络下载不便），会自动回退尝试启动本机已安装的正式版 Google Chrome。
 
-```
-There was an error managing chromedriver (error sending request for url (https://googlechromelabs.github.io/...))
-using driver found in the cache
-SessionNotCreatedException: This version of ChromeDriver only supports Chrome version 135
-Current browser version is 150.0.7871.187
-```
-
-Selenium Manager 联网失败，退回用了缓存里的旧 chromedriver，跟本机 Chrome 版本不匹配。
-手动指定一个匹配的 driver 即可：
+如果 Chrome 装在非默认位置，可显式指定路径：
 
 ```powershell
-# 1. 看本机 Chrome 版本：chrome://version，比如 150.0.7871.187
-# 2. 从镜像下同大版本的 chromedriver-win64.zip 并解压
-#    https://registry.npmmirror.com/binary.html?path=chrome-for-testing/
-# 3. 指定路径跑
-uv run pdl-crawl --driver-path "C:\tools\chromedriver.exe"
+uv run pdl-crawl --chrome-binary "C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 # 或者设一次环境变量，之后照常跑
-$env:PDL_CHROMEDRIVER = "C:\tools\chromedriver.exe"
+$env:PDL_CHROME_BINARY = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 uv run pdl-crawl
 ```
-
-Chrome 装在非默认位置的话，再加 `--chrome-binary`（或环境变量 `PDL_CHROME_BINARY`）。
-
-另一条路是让 Selenium Manager 能联网（挂代理），并清掉旧缓存后重试：
-
-```powershell
-# PowerShell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\selenium" -ErrorAction SilentlyContinue
-```
-
-```bash
-# Linux / macOS
-rm -rf ~/.cache/selenium
-```
-
-注意清缓存只在**网络确实通了**之后才有意义 —— 缓存没了但仍连不上 googlechromelabs.github.io，
-Selenium Manager 就彻底没 driver 可用了，还是得走上面 `--driver-path` 那条路。
 
 ## 断点续跑
 
@@ -103,7 +79,7 @@ data/
 | `--download-mode click`（默认） | 真的去点页面上的 Download 按钮，由 Chrome 下载，行为跟人工完全一致                           |
 | `--download-mode api`           | 从详情页拿到条目 UUID 后走 DSpace REST 直链下载，**明显更快，且大文件支持 Range 续传** |
 
-元数据始终是 Selenium 从渲染后的 DOM 抓的，两种模式没有区别。批量跑建议用 `api`。
+元数据始终是 Playwright 从渲染后的 DOM 抓的，两种模式没有区别。批量跑建议用 `api`。
 
 下载过程会用 `tqdm` 显示实时进度条（速度、百分比、ETA）。api 模式下用 `--concurrency`
 控制**同一条目内**多个文件的并发下载数（默认 3）——多数条目只有 1 个附件，并发数在这种条目上
@@ -126,8 +102,7 @@ data/
 --recheck-no-file     重新核实标记为 no_file 的条目（修复过去误判"无附件"的老数据用）
 --restart-every N     每 N 条重启一次浏览器释放内存（默认 200）
 --headed              显示浏览器窗口，调试用
---driver-path PATH    手动指定 chromedriver（等价环境变量 PDL_CHROMEDRIVER）
---chrome-binary PATH  手动指定 Chrome 可执行文件（等价环境变量 PDL_CHROME_BINARY）
+--chrome-binary PATH  手动指定 Chrome/Chromium 可执行文件（等价环境变量 PDL_CHROME_BINARY）
 ```
 
 完整列表见 `uv run pdl-crawl --help`。
@@ -151,7 +126,8 @@ uv run pdl-crawl --search-url "https://elibrary.sansad.in/search?query=tibet&...
 | 文件                                      | 职责                                                         |
 | ----------------------------------------- | ------------------------------------------------------------ |
 | [crawler/run.py](crawler/run.py)           | 主流程、CLI、重试与浏览器重启策略                            |
-| [crawler/pages.py](crawler/pages.py)       | 列表页 / 详情页解析（用`execute_script` 一次取回整块数据） |
+| [crawler/pages.py](crawler/pages.py)       | 列表页 / 详情页解析（用`page.evaluate` 一次取回整块数据）    |
 | [crawler/download.py](crawler/download.py) | click 与 api 两种下载实现                                    |
 | [crawler/state.py](crawler/state.py)       | `state.json` 的原子读写与状态机                            |
-| [crawler/browser.py](crawler/browser.py)   | Chrome 驱动创建、隐私弹窗处理                                |
+| [crawler/browser.py](crawler/browser.py)   | Playwright 浏览器会话创建、隐私弹窗处理                      |
+| [crawler/stealth.py](crawler/stealth.py)   | 浏览器指纹隐匿补丁、贝塞尔曲线鼠标轨迹与滚轮拟真操作         |

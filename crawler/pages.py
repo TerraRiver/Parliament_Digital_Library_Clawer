@@ -1,7 +1,7 @@
 """列表页与详情页的解析。
 
-DSpace 前端是 Angular，DOM 层级很深；这里用一次 execute_script 把整块数据
-取回来，而不是几百次 find_element 往返 —— 单条目详情页有 200 个字段容器，
+DSpace 前端是 Angular，DOM 层级很深；这里用一次 page.evaluate 把整块数据
+取回来，而不是几百次 DOM 查询往返 —— 单条目详情页有 200 个字段容器，
 逐个取会慢一个数量级。
 """
 
@@ -12,12 +12,10 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .browser import dismiss_consent, goto
+from .stealth import human_idle_reading_gesture, human_page_scan_scroll, human_reset_gaze
 
 RESULT_SELECTOR = "ds-item-search-result-list-element"
 ITEM_READY_SELECTOR = "ds-metadata-field-wrapper"
@@ -33,7 +31,7 @@ _SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
 
 # 列表页：每条结果取 uuid / 标题 / 年份 / 类型 / 命中次数
 _JS_RESULTS = """
-return Array.from(document.querySelectorAll(arguments[0])).map(el => {
+(selector) => Array.from(document.querySelectorAll(selector)).map(el => {
   const a = el.querySelector('a.item-list-title');
   const cols = el.querySelectorAll('.row > div');
   const kw = el.querySelector('.keyword-count');
@@ -45,40 +43,42 @@ return Array.from(document.querySelectorAll(arguments[0])).map(el => {
     item_type: type ? type.textContent.trim() : null,
     keyword_count: kw ? kw.textContent.replace(/[^0-9]/g, '') : null,
   };
-});
+})
 """
 
 # 详情页：字段容器（空字段带 d-none，跳过）+ 文件表格
 _JS_ITEM = """
-const fields = {};
-document.querySelectorAll('ds-metadata-field-wrapper div.wrap-row').forEach(row => {
-  if (row.classList.contains('d-none')) return;
-  const t = row.querySelector('.title-col');
-  const d = row.querySelector('.desc-col');
-  if (!t || !d) return;
-  const label = t.textContent.trim();
-  if (!label) return;
-  const values = Array.from(d.querySelectorAll(':scope > div > span'))
-    .map(s => s.textContent.trim()).filter(Boolean);
-  const text = d.innerText.trim();
-  if (!values.length && !text) return;
-  fields[label] = values.length ? values : [text];
-});
-const files = Array.from(document.querySelectorAll('div.row.py-2')).map(row => {
-  const n = row.querySelector('.name-file');
-  const s = row.querySelector('.size-file');
-  const btn = row.querySelector('ds-file-download-link button');
-  if (!n || !btn) return null;
-  return {name: n.textContent.trim(), size_text: s ? s.textContent.trim() : null};
-}).filter(Boolean);
-return {fields, files, title: document.title};
+() => {
+  const fields = {};
+  document.querySelectorAll('ds-metadata-field-wrapper div.wrap-row').forEach(row => {
+    if (row.classList.contains('d-none')) return;
+    const t = row.querySelector('.title-col');
+    const d = row.querySelector('.desc-col');
+    if (!t || !d) return;
+    const label = t.textContent.trim();
+    if (!label) return;
+    const values = Array.from(d.querySelectorAll(':scope > div > span'))
+      .map(s => s.textContent.trim()).filter(Boolean);
+    const text = d.innerText.trim();
+    if (!values.length && !text) return;
+    fields[label] = values.length ? values : [text];
+  });
+  const files = Array.from(document.querySelectorAll('div.row.py-2')).map(row => {
+    const n = row.querySelector('.name-file');
+    const s = row.querySelector('.size-file');
+    const btn = row.querySelector('ds-file-download-link button');
+    if (!n || !btn) return null;
+    return {name: n.textContent.trim(), size_text: s ? s.textContent.trim() : null};
+  }).filter(Boolean);
+  return {fields, files, title: document.title};
+}
 """
 
 # 与 _JS_ITEM 里 n && btn 判断口径一致，用来判断"文件行是否渲染完整"
 _JS_FILE_COMPLETE_COUNT = """
-return Array.from(document.querySelectorAll('div.row.py-2')).filter(row =>
+() => Array.from(document.querySelectorAll('div.row.py-2')).filter(row =>
   row.querySelector('.name-file') && row.querySelector('ds-file-download-link button')
-).length;
+).length
 """
 
 
@@ -94,20 +94,19 @@ def build_page_url(search_url: str, page: int, page_size: int) -> str:
 def scrape_list_page(driver, search_url: str, page: int, page_size: int, settle: float = 1.0) -> list[dict[str, Any]]:
     """抓一页搜索结果。返回空列表表示这一页没有结果（翻到底了）。"""
     url = build_page_url(search_url, page, page_size)
-    driver.get(url)
+    driver.goto(url, wait_until="domcontentloaded")
     dismiss_consent(driver)
     try:
-        WebDriverWait(driver, 60).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, f"{RESULT_SELECTOR}, ds-search-results"))
-        )
-    except TimeoutException:
+        driver.wait_for_selector(f"{RESULT_SELECTOR}, ds-search-results", state="attached", timeout=60_000)
+    except PlaywrightTimeoutError:
         return []
     dismiss_consent(driver)
 
     # 结果卡片是异步渲染的，等到数量稳定为止
     prev, stable = -1, 0
+    locator = driver.locator(RESULT_SELECTOR)
     for _ in range(40):
-        count = len(driver.find_elements(By.CSS_SELECTOR, RESULT_SELECTOR))
+        count = locator.count()
         if count and count == prev:
             stable += 1
             if stable >= 2:
@@ -116,9 +115,11 @@ def scrape_list_page(driver, search_url: str, page: int, page_size: int, settle:
             stable = 0
         prev = count
         time.sleep(0.5)
-    time.sleep(settle)
+    if settle > 0:
+        human_page_scan_scroll(driver, target_distance=360.0)
+        human_reset_gaze(driver)
 
-    rows = driver.execute_script(_JS_RESULTS, RESULT_SELECTOR)
+    rows = driver.evaluate(_JS_RESULTS, RESULT_SELECTOR)
     out = []
     for row in rows:
         uuid = _uuid_from_href(row.get("href") or "")
@@ -148,7 +149,7 @@ def scrape_item_page(driver, item_url: str) -> dict[str, Any]:
     """
     goto(driver, item_url, ITEM_READY_SELECTOR, timeout=60)
     _wait_for_files_settled(driver)
-    data = driver.execute_script(_JS_ITEM)
+    data = driver.evaluate(_JS_ITEM)
     for f in data["files"]:
         f["size_bytes_expected"] = parse_size(f.get("size_text"))
     return data
@@ -166,9 +167,12 @@ def _wait_for_files_settled(driver) -> None:
     _FILE_WAIT_TIMEOUT 才能下结论，否则会把"异步请求还没回来"当成"没有文件"。
     """
     start = time.monotonic()
+    human_idle_reading_gesture(
+        driver, driver.locator(ITEM_READY_SELECTOR).first, min_pause_ms=100, max_pause_ms=250
+    )
     prev, stable = -1, 0
     while time.monotonic() - start < _FILE_WAIT_TIMEOUT:
-        count = driver.execute_script(_JS_FILE_COMPLETE_COUNT)
+        count = driver.evaluate(_JS_FILE_COMPLETE_COUNT)
         stable = stable + 1 if count == prev else 0
         prev = count
         if count > 0 and time.monotonic() - start >= _FILE_WAIT_MIN and stable >= _FILE_WAIT_STABLE_POLLS:
@@ -177,7 +181,7 @@ def _wait_for_files_settled(driver) -> None:
 
 
 def find_download_buttons(driver):
-    return driver.find_elements(By.CSS_SELECTOR, DOWNLOAD_BTN)
+    return driver.locator(DOWNLOAD_BTN)
 
 
 def parse_size(text: str | None) -> int | None:

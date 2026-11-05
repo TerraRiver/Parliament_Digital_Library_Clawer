@@ -14,11 +14,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from selenium.common.exceptions import WebDriverException
+from playwright.sync_api import Error as PlaywrightError
 
 from . import pages, state as st
 from .browser import make_driver
 from .download import download_item_files
+from .stealth import human_wait
 
 DEFAULT_SEARCH_URL = (
     "https://elibrary.sansad.in/search"
@@ -151,10 +152,11 @@ class Crawler:
                 return None
 
         self._check_stop()
-        driver = self._ensure_driver()
         rows = self._with_retries(
             f"列表页 p{page}",
-            lambda: pages.scrape_list_page(driver, self.args.search_url, page, self.args.page_size),
+            lambda: pages.scrape_list_page(
+                self._ensure_driver(), self.args.search_url, page, self.args.page_size
+            ),
         )
         if not rows:
             self.state.mark_page(page, "done", 0)
@@ -188,10 +190,9 @@ class Crawler:
             self._restart_driver()
 
         try:
-            driver = self._ensure_driver()
             data = self._with_retries(
                 f"详情页 {uuid}",
-                lambda: pages.scrape_item_page(driver, row["url"]),
+                lambda: pages.scrape_item_page(self._ensure_driver(), row["url"]),
             )
             self.state.update(
                 uuid,
@@ -221,7 +222,7 @@ class Crawler:
                 print(f"  [{self.processed + 1}] {label} — 元数据已存（{len(data['files'])} 个文件，未下载）")
             else:
                 files = download_item_files(
-                    driver,
+                    self._ensure_driver(),
                     item=row,
                     files=data["files"],
                     dest_dir=self.files_dir / uuid,
@@ -246,8 +247,8 @@ class Crawler:
             failed = attempts >= self.args.max_retries
             self.state.update(uuid, status=st.FAILED if failed else st.PENDING, error=msg)
             print(f"  [!] {label} 第 {attempts} 次失败{'（放弃）' if failed else ''}：{msg}")
-            if isinstance(exc, WebDriverException):
-                self._restart_driver()
+            if isinstance(exc, PlaywrightError) or isinstance(exc.__cause__, PlaywrightError):
+                self._quit_driver()
         finally:
             self.processed += 1
             self.items_since_restart += 1
@@ -266,13 +267,22 @@ class Crawler:
                 last = exc
                 wait = min(2**attempt, 30) + random.uniform(0, 1)
                 print(f"  [retry] {what} 第 {attempt} 次失败（{type(exc).__name__}），{wait:.1f}s 后重试")
-                if isinstance(exc, WebDriverException):
-                    self._restart_driver()
-                time.sleep(wait)
+                if isinstance(exc, PlaywrightError) or isinstance(exc.__cause__, PlaywrightError):
+                    self._quit_driver()
+                if attempt < self.args.page_retries:
+                    time.sleep(wait)
         raise last
 
     def _sleep(self):
         if self.args.delay > 0:
+            min_ms = int(self.args.delay * 1000)
+            max_ms = int(self.args.delay * 1300)
+            if self.driver is not None:
+                try:
+                    human_wait(self.driver, min_ms, max_ms)
+                    return
+                except Exception:
+                    pass
             time.sleep(self.args.delay + random.uniform(0, self.args.delay * 0.3))
 
     def _report(self, elapsed: float):
@@ -300,7 +310,7 @@ def _mb(n: int) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="parliament-crawler",
-        description="爬取 Parliament Digital Library 搜索结果的元数据与附件（Selenium，支持断点续跑）",
+        description="爬取 Parliament Digital Library 搜索结果的元数据与附件（Playwright，支持断点续跑）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--search-url", default=DEFAULT_SEARCH_URL, help="搜索结果页 URL")
@@ -320,10 +330,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--headed", action="store_true", help="显示浏览器窗口（调试用）")
     p.add_argument("--driver-path", default=None,
-                   help="chromedriver 路径。不给则由 Selenium Manager 自动下载（需联网）；"
-                        "也可用环境变量 PDL_CHROMEDRIVER")
+                   help="已废弃（Playwright 无需 chromedriver，保留仅为兼容旧脚本）")
     p.add_argument("--chrome-binary", default=None,
-                   help="Chrome 可执行文件路径（装在非默认位置时用）；也可用环境变量 PDL_CHROME_BINARY")
+                   help="Chrome/Chromium 可执行文件路径（装在非默认位置时用）；也可用环境变量 PDL_CHROME_BINARY")
     p.add_argument("--delay", type=float, default=1.0, help="每条之间的基础间隔秒数")
     p.add_argument("--max-retries", type=int, default=3, help="单条目累计失败多少次后标记为 failed")
     p.add_argument("--page-retries", type=int, default=3, help="单次页面加载的重试次数")
