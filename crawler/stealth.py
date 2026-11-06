@@ -316,9 +316,9 @@ def human_move_and_click(
         page, (random.uniform(300, 900), random.uniform(200, 600))
     )
 
-    # 2. 按钮内部 30%~70% 随机落点
-    target_x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-    target_y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+    # 2. 按钮内部 30%~70% 随机落点（限制在视口范围内）
+    target_x = max(1.0, min(vw - 1.0, box["x"] + box["width"] * random.uniform(0.3, 0.7)))
+    target_y = max(1.0, min(vh - 1.0, box["y"] + box["height"] * random.uniform(0.3, 0.7)))
 
     dist = math.hypot(target_x - start_x, target_y - start_y)
     steps = max(14, min(45, int(dist / 14) + random.randint(-3, 5)))
@@ -361,12 +361,17 @@ def human_move_and_click(
     page.wait_for_timeout(hover_ms)
     _MOUSE_POS[page] = (target_x, target_y)
 
-    # 7. 命中校验：确认 (target_x, target_y) 未被顶栏/浮层遮挡，否则降级使用 JS click 兜底
+    # 7. 命中校验：确认 (target_x, target_y) 未被顶栏/浮层遮挡，否则降级点击兜底
     try:
-        hit_ok = locator.evaluate(
-            "(el, pt) => { const hit = document.elementFromPoint(pt.x, pt.y); return Boolean(hit && (el === hit || el.contains(hit))); }",
-            {"x": target_x, "y": target_y},
-            timeout=1_500,
+        hit_ok = bool(
+            locator.evaluate(
+                "(el, pt) => {"
+                "  const hit = document.elementFromPoint(pt.x, pt.y);"
+                "  return Boolean(hit && (el === hit || el.contains(hit) || hit.contains(el)));"
+                "}",
+                {"x": target_x, "y": target_y},
+                timeout=1_500,
+            )
         )
     except PlaywrightError:
         hit_ok = False
@@ -377,4 +382,7 @@ def human_move_and_click(
         page.wait_for_timeout(hold_ms)
         page.mouse.up()
     else:
-        locator.evaluate("el => el.click()", timeout=timeout)
+        try:
+            locator.click(timeout=timeout)
+        except PlaywrightError:
+            locator.evaluate("el => el.click()", timeout=timeout)

@@ -171,7 +171,7 @@ def dismiss_consent(driver: BrowserSession | Page, timeout: float = 0.0) -> bool
         except PlaywrightError:
             return False
 
-    # 等遮罩淡出（若点击未生效，半途补一次 JS click 兜底）
+    # 等遮罩淡出（若点击未生效且按钮仍在，半途补一次 JS click 兜底）
     overlay = driver.locator(CONSENT_OVERLAY)
     cleared = False
     for i in range(20):
@@ -179,8 +179,11 @@ def dismiss_consent(driver: BrowserSession | Page, timeout: float = 0.0) -> bool
             if overlay.count() == 0:
                 cleared = True
                 break
-            if i == 8:
-                btn.evaluate("el => el.click()", timeout=1_000)
+            if i == 8 and btn.count() > 0 and btn.is_visible():
+                try:
+                    btn.evaluate("el => el.click()", timeout=1_000)
+                except PlaywrightError:
+                    pass
         except PlaywrightError:
             break
         driver.wait_for_timeout(100)
