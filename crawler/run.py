@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import signal
 import sys
@@ -28,6 +29,52 @@ DEFAULT_SEARCH_URL = (
     "&spc.sf=keyword_count&spc.sd=DESC"
 )
 DEFAULT_API_BASE = "https://elibrary.sansad.in/server/api"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_dotenv(dotenv_path: Path | None = None, *, override: bool = False) -> None:
+    """加载项目根目录或当前工作目录下的 .env 文件到 os.environ。"""
+    candidates = [dotenv_path] if dotenv_path else [Path.cwd() / ".env", PROJECT_ROOT / ".env"]
+    seen: set[Path] = set()
+    for path in candidates:
+        if path is None:
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            lines = resolved.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if not key:
+                continue
+            if len(val) >= 2 and val[0] in ("'", '"'):
+                q = val[0]
+                end_idx = val.find(q, 1)
+                if end_idx != -1 and (not val[end_idx + 1 :].strip() or val[end_idx + 1 :].strip().startswith("#")):
+                    val = val[1:end_idx]
+            else:
+                # 去掉未加引号值后面的行内注释
+                val = val.split(" #", 1)[0].split("\t#", 1)[0].strip()
+            if not val:
+                continue
+            if override or key not in os.environ:
+                os.environ[key] = val
 
 
 class Interrupted(Exception):
@@ -38,8 +85,12 @@ class Crawler:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.data_dir = Path(args.data_dir).expanduser().resolve()
-        self.files_dir = self.data_dir / "files"
-        self.staging_dir = self.data_dir / ".staging"
+        if getattr(args, "output_dir", None):
+            self.files_dir = Path(args.output_dir).expanduser().resolve()
+            self.staging_dir = self.files_dir / ".staging"
+        else:
+            self.files_dir = self.data_dir / "files"
+            self.staging_dir = self.data_dir / ".staging"
         self.state = st.State(self.data_dir / "state.json", self.data_dir / "metadata.jsonl")
         self._warn_if_changed("search_url", args.search_url)
         # 换了每页条数会让已记录的页号对不上，续跑时必须保持一致
@@ -169,10 +220,10 @@ class Crawler:
                 self._ensure_driver(), self.args.search_url, page, self.args.page_size
             ),
         )
-        if isinstance(total, int) and total >= 0:
-            self.state.data["total_expected"] = total
         if not rows:
             return None
+        if isinstance(total, int) and total > 0:
+            self.state.data["total_expected"] = total
 
         new = sum(
             self.state.add_discovered(
@@ -337,6 +388,7 @@ class Crawler:
         print(f"已下载 {_mb(s.get('downloaded_bytes', 0))}")
         print(f"状态文件 {self.state.path}")
         print(f"元数据   {self.state.metadata_path}")
+        print(f"文件目录 {self.files_dir}")
         print("=" * 60)
 
 
@@ -349,13 +401,25 @@ def _mb(n: int) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    load_dotenv()
+    default_data_dir = os.environ.get("PDL_DATA_DIR") or os.environ.get("DATA_DIR") or "data"
+    default_output_dir = (
+        os.environ.get("PDL_OUTPUT_DIR")
+        or os.environ.get("OUTPUT_DIR")
+        or os.environ.get("PDL_FILES_DIR")
+        or None
+    )
+
     p = argparse.ArgumentParser(
         prog="parliament-crawler",
         description="爬取 Parliament Digital Library 搜索结果的元数据与附件（Playwright，支持断点续跑）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--search-url", default=DEFAULT_SEARCH_URL, help="搜索结果页 URL")
-    p.add_argument("--data-dir", default="data", help="状态、元数据与附件的存放目录")
+    p.add_argument("--data-dir", default=default_data_dir,
+                   help="状态、元数据与默认附件的存放目录（也可在 .env 中设 PDL_DATA_DIR）")
+    p.add_argument("--output-dir", default=default_output_dir,
+                   help="下载的 PDF 附件输出目录，不指定则存于 <data-dir>/files（也可在 .env 中设 PDL_OUTPUT_DIR）")
     p.add_argument("--page-size", type=int, default=100, help="每页条目数（spc.rpp）")
     p.add_argument("--start-page", type=int, default=1, help="从第几页开始")
     p.add_argument("--max-pages", type=int, default=0, help="本次最多翻几页，0 为不限")

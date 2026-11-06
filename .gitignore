@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# 本地环境变量配置
+.env
+
 # 爬取产物（状态文件、元数据、下载的 PDF）
 data/
 

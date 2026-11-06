@@ -22,7 +22,7 @@ from crawler.download import (
     safe_filename,
 )
 from crawler.pages import _is_list_page_eof, build_page_url, parse_size
-from crawler.run import Crawler, Interrupted, build_parser
+from crawler.run import Crawler, Interrupted, build_parser, load_dotenv
 from crawler.state import DONE, FAILED, METADATA, NO_FILE, PENDING, State
 
 
@@ -243,6 +243,57 @@ class TestStateAndAttempts(unittest.TestCase):
                 crawler._process_item(row)
             self.assertEqual(crawler.state.get(uuid)["attempts"], 0)
             self.assertEqual(crawler.state.get(uuid)["status"], METADATA)
+
+    @patch("crawler.run.make_driver")
+    def test_page_rows_does_not_overwrite_total_expected_with_zero_on_empty_page(
+        self, mock_make_driver: MagicMock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            args = build_parser().parse_args(["--data-dir", tmp, "--no-download"])
+            crawler = Crawler(args)
+            crawler.state.data["total_expected"] = 36376
+
+            with patch("crawler.run.pages.scrape_list_page", return_value=([], 0)):
+                res = crawler._page_rows(365)
+            self.assertIsNone(res)
+            self.assertEqual(crawler.state.data["total_expected"], 36376)
+
+    def test_dotenv_and_output_dir_configuration(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env_file = tmp_path / ".env"
+            custom_data = tmp_path / "custom_data"
+            custom_files = tmp_path / "external_files"
+            env_file.write_text(
+                f"# 注释行\n"
+                f"PDL_DATA_DIR={custom_data}\n"
+                f'PDL_OUTPUT_DIR="{custom_files}" # 行内注释\n'
+                f"EMPTY_VAR=\n",
+                encoding="utf-8",
+            )
+            old_data = os.environ.pop("PDL_DATA_DIR", None)
+            old_out = os.environ.pop("PDL_OUTPUT_DIR", None)
+            try:
+                load_dotenv(env_file, override=True)
+                self.assertEqual(os.environ.get("PDL_DATA_DIR"), str(custom_data))
+                self.assertEqual(os.environ.get("PDL_OUTPUT_DIR"), str(custom_files))
+                self.assertNotIn("EMPTY_VAR", os.environ)
+
+                with patch("crawler.run.load_dotenv"):
+                    args = build_parser().parse_args([])
+                crawler = Crawler(args)
+                self.assertEqual(crawler.data_dir, custom_data.resolve())
+                self.assertEqual(crawler.files_dir, custom_files.resolve())
+                self.assertEqual(crawler.staging_dir, custom_files.resolve() / ".staging")
+            finally:
+                os.environ.pop("PDL_DATA_DIR", None)
+                os.environ.pop("PDL_OUTPUT_DIR", None)
+                if old_data is not None:
+                    os.environ["PDL_DATA_DIR"] = old_data
+                if old_out is not None:
+                    os.environ["PDL_OUTPUT_DIR"] = old_out
 
 
 if __name__ == "__main__":
