@@ -12,14 +12,13 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
 from .browser import dismiss_consent, goto
 from .stealth import human_idle_reading_gesture, human_page_scan_scroll, human_reset_gaze
 
 RESULT_SELECTOR = "ds-item-search-result-list-element"
 ITEM_READY_SELECTOR = "ds-metadata-field-wrapper"
-DOWNLOAD_BTN = "button.link-download-doc"
+FILE_ROW_SELECTOR = "div.row.py-2:has(.name-file):has(ds-file-download-link button)"
+DOWNLOAD_BTN = f"{FILE_ROW_SELECTOR} ds-file-download-link button"
 
 # 文件行渲染延迟抖动很大，等到数量稳定再读；真没有文件的条目会一直等到超时
 _FILE_WAIT_MIN = 1.5       # 至少等这么久才开始认稳定，太快退出会漏掉慢加载的行
@@ -44,6 +43,29 @@ _JS_RESULTS = """
     keyword_count: kw ? kw.textContent.replace(/[^0-9]/g, '') : null,
   };
 })
+"""
+
+# 列表页状态检测：从 ds-pagination 提取总条数，并检测加载动画与明确的无结果提示
+_JS_LIST_STATUS = r"""
+() => {
+  const sr = document.querySelector('ds-search-results, ds-themed-search-results');
+  const loading = Boolean(
+    sr
+      ? sr.querySelector('ds-loading, ds-themed-loading, .spinner-border')
+      : document.querySelector('ds-loading, ds-themed-loading, .spinner-border')
+  );
+  const pagEl = sr ? sr.querySelector('ds-pagination, .pagination-info') : null;
+  const pagText = (pagEl ? pagEl.innerText : (sr ? sr.innerText : '')) || '';
+  const srText = (sr && sr.innerText) ? sr.innerText : '';
+  const m = pagText.match(/showing\s+[\d,]+\s*[-–]\s*[\d,]+\s+of\s+([\d,]+)/i);
+  const total = m ? parseInt(m[1].replace(/,/g, ''), 10) : null;
+  const noResult = /your\s+search\s+returned\s+no\s+results|no\s+results\s+found|(?<![\d,])0\s+results\b/i.test(srText);
+  return {
+    loading,
+    total: Number.isFinite(total) ? total : null,
+    no_result: noResult,
+  };
+}
 """
 
 # 详情页：字段容器（空字段带 d-none，跳过）+ 文件表格
@@ -83,23 +105,43 @@ _JS_FILE_COMPLETE_COUNT = """
 
 
 def build_page_url(search_url: str, page: int, page_size: int) -> str:
-    """把 spc.page / spc.rpp 塞进搜索 URL（DSpace 的分页参数）。"""
+    """把 spc.page / spc.rpp 塞进搜索 URL（保留同名多值筛选参数）。"""
     parts = urlsplit(search_url)
-    params = dict(parse_qsl(parts.query, keep_blank_values=True))
-    params["spc.page"] = str(page)
-    params["spc.rpp"] = str(page_size)
-    return urlunsplit(parts._replace(query=urlencode(params)))
+    pairs = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k not in ("spc.page", "spc.rpp")
+    ]
+    pairs.append(("spc.page", str(page)))
+    pairs.append(("spc.rpp", str(page_size)))
+    return urlunsplit(parts._replace(query=urlencode(pairs)))
 
 
-def scrape_list_page(driver, search_url: str, page: int, page_size: int, settle: float = 1.0) -> list[dict[str, Any]]:
-    """抓一页搜索结果。返回空列表表示这一页没有结果（翻到底了）。"""
+def _is_list_page_eof(status: dict[str, Any], page: int, page_size: int) -> bool:
+    """判断列表页是否明确翻到底（无结果）。
+
+    有 total 数字时以数字为准（优先级高于 no_result）；
+    若因加载慢导致 total=None 且无 no_result 提示，返回 False 以便外层抛错触发重试。
+    """
+    if status.get("loading"):
+        return False
+    total = status.get("total")
+    if isinstance(total, int) and page >= 1 and page_size >= 1:
+        return (page - 1) * page_size >= total
+    return bool(status.get("no_result"))
+
+
+def scrape_list_page(
+    driver, search_url: str, page: int, page_size: int, settle: float = 1.0
+) -> tuple[list[dict[str, Any]], int | None]:
+    """抓一页搜索结果，返回 (rows, total_expected)。
+
+    返回空列表仅表示明确翻到底了；若因网络慢或渲染超时未拿到卡片，抛出异常交由重试机制处理。
+    """
     url = build_page_url(search_url, page, page_size)
     driver.goto(url, wait_until="domcontentloaded")
     dismiss_consent(driver)
-    try:
-        driver.wait_for_selector(f"{RESULT_SELECTOR}, ds-search-results", state="attached", timeout=60_000)
-    except PlaywrightTimeoutError:
-        return []
+    driver.wait_for_selector(f"{RESULT_SELECTOR}, ds-search-results", state="attached", timeout=60_000)
     dismiss_consent(driver)
 
     # 结果卡片是异步渲染的，等到数量稳定为止
@@ -111,13 +153,22 @@ def scrape_list_page(driver, search_url: str, page: int, page_size: int, settle:
             stable += 1
             if stable >= 2:
                 break
+        elif count == 0:
+            status = driver.evaluate(_JS_LIST_STATUS)
+            if _is_list_page_eof(status, page, page_size):
+                break
+            stable = 0
         else:
             stable = 0
         prev = count
-        time.sleep(0.5)
-    if settle > 0:
+        driver.wait_for_timeout(500)
+
+    if settle > 0 and prev > 0:
         human_page_scan_scroll(driver, target_distance=360.0)
         human_reset_gaze(driver)
+
+    status = driver.evaluate(_JS_LIST_STATUS)
+    total = status.get("total") if isinstance(status.get("total"), int) else None
 
     rows = driver.evaluate(_JS_RESULTS, RESULT_SELECTOR)
     out = []
@@ -135,7 +186,16 @@ def scrape_list_page(driver, search_url: str, page: int, page_size: int, settle:
                 "keyword_count": _to_int(row.get("keyword_count")),
             }
         )
-    return out
+
+    if not out:
+        if _is_list_page_eof(status, page, page_size):
+            return [], total
+        raise RuntimeError(
+            f"第 {page} 页未渲染出结果卡片（total={total}, "
+            f"loading={status.get('loading')}, no_result={status.get('no_result')}）"
+        )
+
+    return out, total
 
 
 def scrape_item_page(driver, item_url: str) -> dict[str, Any]:
@@ -171,16 +231,18 @@ def _wait_for_files_settled(driver) -> None:
         driver, driver.locator(ITEM_READY_SELECTOR).first, min_pause_ms=100, max_pause_ms=250
     )
     prev, stable = -1, 0
+    interval_ms = int(_FILE_WAIT_INTERVAL * 1000)
     while time.monotonic() - start < _FILE_WAIT_TIMEOUT:
         count = driver.evaluate(_JS_FILE_COMPLETE_COUNT)
         stable = stable + 1 if count == prev else 0
         prev = count
         if count > 0 and time.monotonic() - start >= _FILE_WAIT_MIN and stable >= _FILE_WAIT_STABLE_POLLS:
             return
-        time.sleep(_FILE_WAIT_INTERVAL)
+        driver.wait_for_timeout(interval_ms)
 
 
 def find_download_buttons(driver):
+    """返回与 _JS_ITEM 过滤口径严格一致的文件下载按钮 Locator。"""
     return driver.locator(DOWNLOAD_BTN)
 
 

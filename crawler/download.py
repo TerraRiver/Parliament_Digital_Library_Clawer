@@ -74,8 +74,12 @@ def download_item_files(
     dest_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any] | None] = [None] * len(files)
     pending: list[tuple[int, dict[str, Any], Path, int | None]] = []
+    used_names: set[str] = set()
+    budget = _name_budget(dest_dir)
+
     for index, meta in enumerate(files):
-        name = safe_filename(meta["name"], max_len=_name_budget(dest_dir))
+        raw_safe = safe_filename(meta["name"], max_len=budget)
+        name = _deduplicate_filename(raw_safe, used_names, max_len=budget)
         target = dest_dir / name
         expected = meta.get("size_bytes_expected")
         if _already_ok(target, expected):
@@ -91,6 +95,7 @@ def download_item_files(
                 got = _download_via_click(
                     driver,
                     index=index,
+                    total_files=len(files),
                     target=target,
                     staging_dir=staging_dir,
                     expected=expected,
@@ -105,12 +110,32 @@ def download_item_files(
 
 
 def _already_ok(target: Path, expected: int | None) -> bool:
-    if not target.exists() or target.stat().st_size == 0:
+    if not _validate_downloaded_file(target):
         return False
     if expected is None:
         return True
     # 页面上的体积是四舍五入到两位小数的，留 2% 容差
     return abs(target.stat().st_size - expected) <= max(expected * 0.02, 4096)
+
+
+def _validate_downloaded_file(path: Path, suffix_hint: str | None = None) -> bool:
+    """校验文件非空，且非伪装成附件的 HTML 错误页；若是 PDF 则校验 %PDF- 文件头。"""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        return False
+
+    ext = (suffix_hint if suffix_hint is not None else path.suffix).lower()
+    if ext == ".pdf":
+        return b"%PDF-" in head
+    if ext not in (".html", ".htm"):
+        stripped = head.lstrip()[:32].lower()
+        if stripped.startswith((b"<!doctype html", b"<html")):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------- click 模式
@@ -120,6 +145,7 @@ def _download_via_click(
     driver,
     *,
     index: int,
+    total_files: int | None = None,
     target: Path,
     staging_dir: Path,
     expected: int | None,
@@ -133,6 +159,10 @@ def _download_via_click(
 
     buttons = find_download_buttons(driver)
     count = buttons.count()
+    if total_files is not None and count != total_files:
+        raise DownloadError(
+            f"页面下载按钮数量（{count}）与解析出的文件数（{total_files}）不一致，拒绝按序号盲点"
+        )
     if index >= count:
         raise DownloadError(f"页面上只有 {count} 个下载按钮，取不到第 {index + 1} 个")
     btn = buttons.nth(index)
@@ -151,6 +181,7 @@ def _download_via_click(
     download = dl_info.value
     _save_download_with_progress(
         download,
+        driver=driver,
         target=target,
         staging_dir=staging_dir,
         timeout=timeout,
@@ -165,6 +196,7 @@ def _download_via_click(
 def _save_download_with_progress(
     download,
     *,
+    driver=None,
     target: Path,
     staging_dir: Path,
     timeout: float,
@@ -193,12 +225,12 @@ def _save_download_with_progress(
                 abort_error.append(
                     DownloadError(f"下载卡住：{stall_timeout:.0f}s 内体积没有增长（已收 {size} 字节）")
                 )
-                _cancel_download_threadsafe(download)
+                _cancel_download_threadsafe(download, driver, stop_event)
                 return
 
             if time.monotonic() >= deadline:
                 abort_error.append(DownloadError(f"下载超时（{timeout:.0f}s）"))
-                _cancel_download_threadsafe(download)
+                _cancel_download_threadsafe(download, driver, stop_event)
                 return
 
             if bar and size > bar.n:
@@ -213,8 +245,8 @@ def _save_download_with_progress(
         err = download.failure()
         if err:
             raise DownloadError(f"浏览器下载失败：{err}")
-        if not finished_path or not finished_path.exists() or finished_path.stat().st_size == 0:
-            raise DownloadError("下载完成但临时文件为空")
+        if not finished_path or not _validate_downloaded_file(finished_path, suffix_hint=target.suffix):
+            raise DownloadError(f"下载完成但文件校验失败（为空或非有效 {target.suffix or '文件'}）")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(finished_path), str(target))
         if bar:
@@ -236,13 +268,24 @@ def _save_download_with_progress(
             pass
 
 
-def _cancel_download_threadsafe(download) -> None:
+def _cancel_download_threadsafe(download, driver=None, stop_event: threading.Event | None = None) -> None:
+    """跨线程取消下载；若 3 秒内主线程仍未解除阻塞，则强制关闭浏览器会话防止无限挂起。"""
     try:
         impl = getattr(download, "_impl_obj", None)
-        if impl is not None and getattr(impl, "_loop", None) is not None:
-            asyncio.run_coroutine_threadsafe(impl.cancel(), impl._loop)
+        loop = getattr(impl, "_loop", None) if impl is not None else None
+        if impl is not None and loop is not None:
+            asyncio.run_coroutine_threadsafe(impl.cancel(), loop)
     except Exception:
         pass
+
+    if stop_event is not None and not stop_event.wait(3.0) and driver is not None:
+        try:
+            browser_impl = getattr(getattr(driver, "browser", None), "_impl_obj", None)
+            loop = getattr(browser_impl, "_loop", None) if browser_impl is not None else None
+            if browser_impl is not None and loop is not None:
+                asyncio.run_coroutine_threadsafe(browser_impl.close(), loop)
+        except Exception:
+            pass
 
 
 def _safe_file_size(path: Path) -> int:
@@ -281,6 +324,8 @@ def _session_from_driver(driver, api_base: str) -> requests.Session:
         s = requests.Session()
         s.headers["User-Agent"] = USER_AGENT
         s.headers["Referer"] = api_base.rsplit("/server", 1)[0] + "/"
+        # 禁用透明 gzip 压缩，确保 Content-Length 与实际落盘字节数、Range 偏移量严格一致
+        s.headers["Accept-Encoding"] = "identity"
         driver._pdl_session = s
     for c in driver.context.cookies():
         s.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
@@ -372,12 +417,23 @@ def _resolve_bundle_files(s: requests.Session, api_base: str, uuid: str) -> list
 
 
 def _match_bitstream(candidates: list[tuple[str, str]], filename: str) -> str:
+    """将页面上的文件名匹配到 REST bundles 返回的 bitstream 直链。
+
+    多文件条目下必须精确或规范化匹配成功；仅在条目下总共只有 1 个候选文件时才允许兜底。
+    """
     for name, href in candidates:
         if name == filename:
             return href
-    if candidates:
+    norm_target = filename.strip().lower()
+    safe_target = safe_filename(filename).lower()
+    for name, href in candidates:
+        if name.strip().lower() == norm_target or safe_filename(name).lower() == safe_target:
+            return href
+    if len(candidates) == 1:
         return candidates[0][1]
-    raise DownloadError(f"REST 接口里找不到 {filename} 对应的 bitstream")
+    raise DownloadError(
+        f"REST 接口里找不到与 {filename!r} 匹配的 bitstream（候选：{[c[0] for c in candidates]}）"
+    )
 
 
 def _stream_download(
@@ -395,11 +451,32 @@ def _stream_download(
     headers = {"Range": f"bytes={offset}-"} if offset else {}
 
     with s.get(url, headers=headers, stream=True, timeout=(30, 300)) as r:
+        if offset and r.status_code == 416:
+            remote_total = _parse_content_range_total(r.headers.get("Content-Range"))
+            if (remote_total is None or offset == remote_total) and _validate_downloaded_file(
+                part, suffix_hint=target.suffix
+            ):
+                part.replace(target)
+                return target.stat().st_size
+            part.unlink(missing_ok=True)
+            raise requests.RequestException(
+                f"HTTP 416 Range 冲突（本地 .part={offset} 字节，Content-Range={r.headers.get('Content-Range')}），已清理并重下",
+                response=r,
+            )
+
         if offset and r.status_code == 200:  # 服务端不认 Range，从头来
             offset = 0
             part.unlink(missing_ok=True)
         elif r.status_code not in (200, 206):
-            raise DownloadError(f"HTTP {r.status_code} 下载 {url}")
+            r.raise_for_status()
+            raise requests.RequestException(f"HTTP {r.status_code} 下载 {url}", response=r)
+
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype.startswith("text/html") and target.suffix.lower() not in (".html", ".htm"):
+            raise requests.RequestException(
+                f"服务端返回了 HTML 页面而非附件 (Content-Type: {r.headers.get('Content-Type')})",
+                response=r,
+            )
 
         total = _response_total_bytes(r, offset)
         bar = _make_bar(progress_label, total, position, initial=offset) if progress_label else None
@@ -415,8 +492,27 @@ def _stream_download(
             if bar:
                 bar.close()
 
+    actual_size = part.stat().st_size if part.exists() else 0
+    if total is not None and actual_size != total:
+        raise requests.RequestException(
+            f"下载字节数不完整：已收 {actual_size} / 预期 {total} 字节"
+        )
+    if not _validate_downloaded_file(part, suffix_hint=target.suffix):
+        part.unlink(missing_ok=True)
+        raise DownloadError(f"下载的文件内容校验失败（非有效 {target.suffix or '文件'} 或疑似错误页）：{target.name}")
+
     part.replace(target)
     return target.stat().st_size
+
+
+def _parse_content_range_total(content_range: str | None) -> int | None:
+    """解析 'bytes */12345' 或 'bytes 0-99/12345' 中的总长度 12345。"""
+    if not content_range or "/" not in content_range:
+        return None
+    total_str = content_range.rsplit("/", 1)[-1].strip()
+    if total_str == "*" or not total_str.isdigit():
+        return None
+    return int(total_str)
 
 
 def _response_total_bytes(r: requests.Response, offset: int) -> int | None:
@@ -461,3 +557,22 @@ def safe_filename(name: str, max_len: int = 180) -> str:
         return name
     stem, dot, ext = name.rpartition(".")
     return (stem[: max(1, max_len - len(ext) - 1)] + dot + ext) if dot else name[:max_len]
+
+
+def _deduplicate_filename(name: str, used_lower: set[str], max_len: int = 180) -> str:
+    """同一条目内若出现重名（或大小写不敏感冲突），自动追加 _2, _3 后缀避免覆盖或并发写冲突。"""
+    if name.lower() not in used_lower:
+        used_lower.add(name.lower())
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, dot, ext = name, "", ""
+    idx = 2
+    while True:
+        tag = f"_{idx}"
+        budget = max(1, max_len - len(tag) - len(dot) - len(ext))
+        candidate = f"{stem[:budget]}{tag}{dot}{ext}"
+        if candidate.lower() not in used_lower:
+            used_lower.add(candidate.lower())
+            return candidate
+        idx += 1

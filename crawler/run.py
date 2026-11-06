@@ -11,6 +11,7 @@ import random
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ class Crawler:
         self.driver = None
         self.items_since_restart = 0
         self.processed = 0
+        self._reached_eof = False
         self._stop = False
 
     def _warn_if_changed(self, key: str, value) -> None:
@@ -87,15 +89,21 @@ class Crawler:
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
         started = time.time()
+        exit_code = 0
         try:
             self._crawl()
         except Interrupted:
             print("\n[中断] 已收到停止信号，正在保存进度 …")
+            exit_code = 130
+        except Exception as exc:
+            print(f"\n[错误] 爬取因异常中止：{type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            exit_code = 1
         finally:
             self.state.save(force=True)
             self._quit_driver()
-        self._report(time.time() - started)
-        return 0
+            self._report(time.time() - started)
+        return exit_code
 
     def _on_signal(self, *_):
         if self._stop:  # 连按两次直接退出
@@ -121,13 +129,18 @@ class Crawler:
 
             rows = self._page_rows(page)
             if rows is None:  # 翻到底了
+                self._reached_eof = True
                 print(f"[翻页] 第 {page} 页没有结果，全部页面已处理完")
                 return
 
             todo = [
                 r for r in rows
                 if self.state.needs_work(
-                    r["uuid"], self.args.retry_failed, self.args.max_retries, self.args.recheck_no_file
+                    r["uuid"],
+                    self.args.retry_failed,
+                    self.args.max_retries,
+                    self.args.recheck_no_file,
+                    no_download=self.args.no_download,
                 )
             ]
             print(f"[翻页] 第 {page} 页：{len(rows)} 条结果，{len(todo)} 条待处理")
@@ -143,24 +156,22 @@ class Crawler:
             page += 1
 
     def _page_rows(self, page: int) -> list[dict[str, Any]] | None:
-        """拿这一页的条目列表。已抓过的页直接走 state，不再开浏览器。"""
+        """拿这一页的条目列表。已抓过且非空的页直接走 state，不再开浏览器。"""
         if self.state.page_done(page) and not self.args.refresh_pages:
             cached = [r for r in self.state.data["items"].values() if r.get("list_page") == page]
             if cached:
                 return cached
-            if self.state.data["pages"][str(page)].get("count") == 0:
-                return None
 
         self._check_stop()
-        rows = self._with_retries(
+        rows, total = self._with_retries(
             f"列表页 p{page}",
             lambda: pages.scrape_list_page(
                 self._ensure_driver(), self.args.search_url, page, self.args.page_size
             ),
         )
+        if isinstance(total, int) and total >= 0:
+            self.state.data["total_expected"] = total
         if not rows:
-            self.state.mark_page(page, "done", 0)
-            self.state.save(force=True)
             return None
 
         new = sum(
@@ -181,50 +192,61 @@ class Crawler:
     def _process_item(self, row: dict[str, Any]):
         uuid, title = row["uuid"], row.get("title") or ""
         rec = self.state.get(uuid) or row
-        self.state.update(uuid, attempts=rec.get("attempts", 0) + 1)
-        attempts = self.state.get(uuid)["attempts"]
         label = f"{title[:60]}" if title else uuid
+        already_has_meta = (
+            rec.get("status") == st.METADATA
+            and bool(rec.get("files"))
+            and not self.args.no_download
+        )
 
         if self.items_since_restart >= self.args.restart_every:
             print(f"[driver] 已处理 {self.items_since_restart} 条，重启浏览器释放内存")
             self._restart_driver()
 
         try:
-            data = self._with_retries(
-                f"详情页 {uuid}",
-                lambda: pages.scrape_item_page(self._ensure_driver(), row["url"]),
-            )
-            self.state.update(
-                uuid,
-                status=st.METADATA,
-                title=data["fields"].get("Title", [title])[0] if data["fields"].get("Title") else title,
-                field_count=len(data["fields"]),
-                error=None,
-            )
-            self.state.append_metadata(
-                {
-                    "uuid": uuid,
-                    "url": row["url"],
-                    "list_page": row.get("list_page"),
-                    "year": row.get("year"),
-                    "item_type": row.get("item_type"),
-                    "keyword_count": row.get("keyword_count"),
-                    "fields": data["fields"],
-                    "files": data["files"],
-                    "scraped_at": st.now(),
-                }
-            )
+            if already_has_meta and self.args.download_mode == "api":
+                # api 模式下若此前 --no-download 已抓过元数据与文件清单，直接复用，免去重开详情页
+                files_meta = rec["files"]
+            else:
+                data = self._with_retries(
+                    f"详情页 {uuid}",
+                    lambda: pages.scrape_item_page(self._ensure_driver(), row["url"]),
+                )
+                files_meta = data["files"]
+                self.state.update(
+                    uuid,
+                    status=st.METADATA,
+                    title=data["fields"].get("Title", [title])[0] if data["fields"].get("Title") else title,
+                    field_count=len(data["fields"]),
+                    files=files_meta,
+                    error=None,
+                )
+                if not already_has_meta:
+                    self.state.append_metadata(
+                        {
+                            "uuid": uuid,
+                            "url": row["url"],
+                            "list_page": row.get("list_page"),
+                            "year": row.get("year"),
+                            "item_type": row.get("item_type"),
+                            "keyword_count": row.get("keyword_count"),
+                            "fields": data["fields"],
+                            "files": files_meta,
+                            "scraped_at": st.now(),
+                        }
+                    )
 
-            if not data["files"]:
-                self.state.update(uuid, status=st.NO_FILE, files=[])
+            if not files_meta:
+                self.state.update(uuid, status=st.NO_FILE, files=[], attempts=0, error=None)
                 print(f"  [{self.processed + 1}] {label} — 无附件")
             elif self.args.no_download:
-                print(f"  [{self.processed + 1}] {label} — 元数据已存（{len(data['files'])} 个文件，未下载）")
+                self.state.update(uuid, status=st.METADATA, files=files_meta, attempts=0, error=None)
+                print(f"  [{self.processed + 1}] {label} — 元数据已存（{len(files_meta)} 个文件，未下载）")
             else:
                 files = download_item_files(
                     self._ensure_driver(),
                     item=row,
-                    files=data["files"],
+                    files=files_meta,
                     dest_dir=self.files_dir / uuid,
                     staging_dir=self.staging_dir,
                     mode=self.args.download_mode,
@@ -234,7 +256,7 @@ class Crawler:
                     api_base=self.args.api_base,
                     concurrency=self.args.concurrency,
                 )
-                self.state.update(uuid, status=st.DONE, files=files)
+                self.state.update(uuid, status=st.DONE, files=files, attempts=0, error=None)
                 total = sum(f["bytes"] for f in files)
                 skipped = sum(1 for f in files if f["skipped"])
                 note = f"（{skipped} 个已存在，跳过）" if skipped else ""
@@ -244,8 +266,16 @@ class Crawler:
             raise
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+            cur_rec = self.state.get(uuid) or rec
+            attempts = cur_rec.get("attempts", 0) + 1
             failed = attempts >= self.args.max_retries
-            self.state.update(uuid, status=st.FAILED if failed else st.PENDING, error=msg)
+            fallback_status = st.METADATA if cur_rec.get("status") == st.METADATA else st.PENDING
+            self.state.update(
+                uuid,
+                attempts=attempts,
+                status=st.FAILED if failed else fallback_status,
+                error=msg,
+            )
             print(f"  [!] {label} 第 {attempts} 次失败{'（放弃）' if failed else ''}：{msg}")
             if isinstance(exc, PlaywrightError) or isinstance(exc.__cause__, PlaywrightError):
                 self._quit_driver()
@@ -263,6 +293,8 @@ class Crawler:
             self._check_stop()
             try:
                 return fn()
+            except Interrupted:
+                raise
             except Exception as exc:
                 last = exc
                 wait = min(2**attempt, 30) + random.uniform(0, 1)
@@ -287,9 +319,18 @@ class Crawler:
 
     def _report(self, elapsed: float):
         s = self.state.summary()
+        total_items = s.get("total_items", 0)
+        total_expected = s.get("total_expected")
+        expected_note = f"（站点显示总数 {total_expected}）" if isinstance(total_expected, int) else ""
         print("\n" + "=" * 60)
         print(f"本次运行 {elapsed / 60:.1f} 分钟，处理 {self.processed} 条")
-        print(f"累计：{s.get('total_items', 0)} 条目 / {s.get('pages_done', 0)} 页")
+        print(f"累计：{total_items} 条目{expected_note} / {s.get('pages_done', 0)} 页")
+        if self._reached_eof and isinstance(total_expected, int) and total_items < total_expected:
+            diff = total_expected - total_items
+            print(
+                f"  [对账] 已发现条目数比站点总数少 {diff} 条（可能因同分排序跨页漂移），"
+                f"可加 --refresh-pages 重扫列表页补齐"
+            )
         for k in (st.DONE, st.METADATA, st.NO_FILE, st.PENDING, st.FAILED):
             if s.get(k):
                 print(f"  {k:<9} {s[k]}")

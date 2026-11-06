@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import time
+import sys
 from pathlib import Path
 
 from playwright.sync_api import (
@@ -94,14 +94,13 @@ def make_driver(
     browser_binary = browser_binary or os.environ.get("PDL_CHROME_BINARY")
     download_dir.mkdir(parents=True, exist_ok=True)
 
+    launch_args = ["--disable-gpu", "--disable-blink-features=AutomationControlled"]
+    if sys.platform.startswith("linux"):
+        launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
     launch_kwargs = {
         "headless": headless,
-        "args": [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-blink-features=AutomationControlled",
-        ],
+        "args": launch_args,
         "downloads_path": str(download_dir),
         # 交由 crawler/run.py 的信号处理器实现"完成当前条目后安全退出"
         "handle_sigint": False,
@@ -112,16 +111,23 @@ def make_driver(
     pw = sync_playwright().start()
     browser: Browser | None = None
     try:
-        try:
-            if browser_binary:
+        if browser_binary:
+            try:
                 browser = pw.chromium.launch(executable_path=browser_binary, **launch_kwargs)
-            else:
+            except PlaywrightError as exc:
+                raise PlaywrightError(f"{exc}\n{BROWSER_HINT}") from exc
+        else:
+            try:
+                browser = pw.chromium.launch(**launch_kwargs)
+            except PlaywrightError as first_exc:
                 try:
-                    browser = pw.chromium.launch(**launch_kwargs)
-                except PlaywrightError:
                     browser = pw.chromium.launch(channel="chrome", **launch_kwargs)
-        except PlaywrightError as exc:
-            raise PlaywrightError(f"{exc}\n{BROWSER_HINT}") from exc
+                except PlaywrightError as second_exc:
+                    raise PlaywrightError(
+                        f"自带 Chromium 启动失败：{first_exc}\n"
+                        f"本机 Chrome 启动失败：{second_exc}\n"
+                        f"{BROWSER_HINT}"
+                    ) from second_exc
 
         context = browser.new_context(
             viewport={"width": 1600, "height": 1200},
@@ -167,17 +173,19 @@ def dismiss_consent(driver: BrowserSession | Page, timeout: float = 0.0) -> bool
 
     # 等遮罩淡出（若点击未生效，半途补一次 JS click 兜底）
     overlay = driver.locator(CONSENT_OVERLAY)
+    cleared = False
     for i in range(20):
         try:
             if overlay.count() == 0:
+                cleared = True
                 break
             if i == 8:
                 btn.evaluate("el => el.click()", timeout=1_000)
         except PlaywrightError:
             break
-        time.sleep(0.1)
+        driver.wait_for_timeout(100)
     human_reset_gaze(driver)
-    return True
+    return cleared
 
 
 def goto(driver: BrowserSession | Page, url: str, wait_for: str, timeout: int = 60) -> None:

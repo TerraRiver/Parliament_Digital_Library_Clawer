@@ -1,7 +1,7 @@
 [project]
 name = "parliament-digital-library"
 version = "0.1.0"
-description = "Add your description here"
+description = "Playwright crawler for Parliament Digital Library (elibrary.sansad.in) metadata and PDF attachments with resume support"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

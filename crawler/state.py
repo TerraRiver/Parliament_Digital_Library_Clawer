@@ -48,11 +48,18 @@ class State:
 
     def _load(self) -> None:
         try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise OSError(f"[state] 无法读取状态文件 {self.path}：{exc}") from exc
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as exc:
             backup = self.path.with_suffix(f".corrupt.{int(time.time())}.json")
-            self.path.rename(backup)
-            print(f"[state] 状态文件损坏（{exc}），已备份到 {backup}，从零开始")
+            try:
+                self.path.rename(backup)
+                print(f"[state] 状态文件损坏（{exc}），已备份到 {backup}，从零开始")
+            except OSError as rename_exc:
+                print(f"[state] 状态文件损坏（{exc}），且备份失败（{rename_exc}），从零开始")
             return
         if loaded.get("version") != STATE_VERSION:
             print(f"[state] 状态文件版本 {loaded.get('version')} 与当前 {STATE_VERSION} 不符，仍尝试载入")
@@ -127,13 +134,22 @@ class State:
         rec["updated_at"] = now()
         return rec
 
-    def needs_work(self, uuid: str, retry_failed: bool, max_retries: int, recheck_no_file: bool = False) -> bool:
+    def needs_work(
+        self,
+        uuid: str,
+        retry_failed: bool,
+        max_retries: int,
+        recheck_no_file: bool = False,
+        no_download: bool = False,
+    ) -> bool:
         rec = self.data["items"].get(uuid)
         if rec is None:
             return True
         if rec["status"] == NO_FILE:
             return recheck_no_file
         if rec["status"] == DONE:
+            return False
+        if rec["status"] == METADATA and no_download:
             return False
         if rec["status"] == FAILED and not retry_failed:
             return False
@@ -153,6 +169,8 @@ class State:
         out["downloaded_bytes"] = sum(
             f.get("bytes") or 0 for r in self.data["items"].values() for f in r.get("files", [])
         )
+        if isinstance(self.data.get("total_expected"), int):
+            out["total_expected"] = self.data["total_expected"]
         return out
 
 
